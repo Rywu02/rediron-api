@@ -381,6 +381,53 @@ app.get('/api/categorias', async (req, res) => {
     }
 });
 
+// Enviar notificação push para um cliente específico
+app.post('/api/send-notification-to-client', async (req, res) => {
+    try {
+        const { clienteId, titulo, corpo, pedidoId } = req.body;
+        
+        // Buscar tokens do cliente
+        const pool = await sql.connect(dbConfig);
+        const tokensResult = await pool.request()
+            .input('clienteId', sql.Int, clienteId)
+            .query(`
+                SELECT TOKEN FROM FCM_TOKENS 
+                WHERE COD_CLIENTE = @clienteId AND ATIVO = 1
+            `);
+        
+        const tokens = tokensResult.recordset.map(r => r.TOKEN);
+        
+        if (tokens.length === 0) {
+            await pool.close();
+            return res.json({ success: false, message: 'Nenhum token encontrado' });
+        }
+        
+        const { messaging } = require('./firebase-config');
+        
+        const message = {
+            data: {
+                titulo: titulo,
+                corpo: corpo,
+                pedido_id: pedidoId ? pedidoId.toString() : ""
+            },
+            tokens: tokens
+        };
+        
+        const response = await messaging.sendEachForMulticast(message);
+        
+        await pool.close();
+        
+        res.json({
+            success: true,
+            successCount: response.successCount,
+            failureCount: response.failureCount
+        });
+        
+    } catch (err) {
+        console.error('❌ Erro:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
 // Iniciar servidor
 app.listen(PORT, () => {
     console.log(`\n🚀 ======================================`);
