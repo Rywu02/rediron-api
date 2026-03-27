@@ -518,7 +518,9 @@ app.post('/api/send-notification-to-client', async (req, res) => {
         res.status(500).json({ error: err.message });
     }
 });
-
+app.get('/api/test', (req, res) => {
+    res.json({ message: 'Servidor funcionando!' });
+});
 // Iniciar servidor
 app.listen(PORT, () => {
     console.log(`\n🚀 ======================================`);
