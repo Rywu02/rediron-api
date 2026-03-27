@@ -4,6 +4,9 @@ const sql = require('mssql');
 const cors = require('cors');
 require('dotenv').config();
 
+// 🔥 IMPORTAR FIREBASE CONFIG 🔥
+const { admin, messaging } = require('./firebase-config');
+
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -60,7 +63,9 @@ app.get('/', (req, res) => {
             "/api/pedidos/:pedidoId/finalizar",
             "/api/historico/:codCliente",
             "/api/pedidos/:pedidoId/itens",
-            "/api/categorias"
+            "/api/categorias",
+            "/api/save-fcm-token",
+            "/api/send-notification-to-client"
         ]
     });
 });
@@ -277,7 +282,7 @@ app.post('/api/itens-pedido', async (req, res) => {
 app.put('/api/pedidos/:pedidoId/finalizar', async (req, res) => {
     try {
         const { pedidoId } = req.params;
-        const { valorFinal, valorDesconto, status, quantidadeTotalItens } = req.body;
+        const { valorFinal, valorDesconto, status, quantidadeTotalItens, clienteId } = req.body;
         
         const pool = await sql.connect(dbConfig);
         
@@ -298,6 +303,40 @@ app.put('/api/pedidos/:pedidoId/finalizar', async (req, res) => {
             `);
         
         await pool.close();
+        
+        // 🔥 ENVIAR NOTIFICAÇÃO APÓS FINALIZAR PEDIDO 🔥
+        if (clienteId) {
+            try {
+                // Buscar tokens do cliente
+                const tokensPool = await sql.connect(dbConfig);
+                const tokensResult = await tokensPool.request()
+                    .input('clienteId', sql.Int, clienteId)
+                    .query(`
+                        SELECT TOKEN FROM FCM_TOKENS 
+                        WHERE COD_CLIENTE = @clienteId AND ATIVO = 1
+                    `);
+                
+                const tokens = tokensResult.recordset.map(r => r.TOKEN);
+                
+                if (tokens.length > 0) {
+                    const message = {
+                        data: {
+                            titulo: "Pedido Confirmado!",
+                            corpo: `Pedido #${pedidoId} foi confirmado com sucesso!`,
+                            pedido_id: pedidoId.toString()
+                        },
+                        tokens: tokens
+                    };
+                    
+                    const response = await messaging.sendEachForMulticast(message);
+                    console.log(`📨 Notificação enviada: ${response.successCount} sucesso, ${response.failureCount} falhas`);
+                }
+                
+                await tokensPool.close();
+            } catch (notifyErr) {
+                console.error('❌ Erro ao enviar notificação:', notifyErr.message);
+            }
+        }
         
         res.json({ success: true });
     } catch (err) {
@@ -381,10 +420,59 @@ app.get('/api/categorias', async (req, res) => {
     }
 });
 
-// Enviar notificação push para um cliente específico
+// 🔥 ENDPOINT PARA SALVAR TOKEN FCM 🔥
+app.post('/api/save-fcm-token', async (req, res) => {
+    try {
+        const { token, codCliente } = req.body;
+        
+        if (!token) {
+            return res.status(400).json({ error: 'Token é obrigatório' });
+        }
+        
+        const pool = await sql.connect(dbConfig);
+        
+        // Verificar se token já existe
+        const checkResult = await pool.request()
+            .input('token', sql.VarChar, token)
+            .query('SELECT 1 FROM FCM_TOKENS WHERE TOKEN = @token');
+        
+        if (checkResult.recordset.length === 0) {
+            // Inserir novo token
+            await pool.request()
+                .input('token', sql.VarChar, token)
+                .input('codCliente', sql.Int, codCliente || null)
+                .input('dataCadastro', sql.DateTime, new Date())
+                .query(`
+                    INSERT INTO FCM_TOKENS (TOKEN, COD_CLIENTE, DATA_CADASTRO, ATIVO)
+                    VALUES (@token, @codCliente, @dataCadastro, 1)
+                `);
+            console.log(`✅ Token salvo para cliente: ${codCliente || 'sem cliente'}`);
+        } else {
+            // Atualizar data
+            await pool.request()
+                .input('token', sql.VarChar, token)
+                .query('UPDATE FCM_TOKENS SET DATA_ATUALIZACAO = GETDATE(), ATIVO = 1 WHERE TOKEN = @token');
+            console.log(`✅ Token atualizado: ${token.substring(0, 20)}...`);
+        }
+        
+        await pool.close();
+        
+        res.json({ success: true, message: 'Token salvo com sucesso' });
+        
+    } catch (err) {
+        console.error('❌ Erro ao salvar token:', err.message);
+        res.status(500).json({ error: err.message });
+    }
+});
+
+// 🔥 ENDPOINT PARA ENVIAR NOTIFICAÇÃO 🔥
 app.post('/api/send-notification-to-client', async (req, res) => {
     try {
         const { clienteId, titulo, corpo, pedidoId } = req.body;
+        
+        if (!clienteId) {
+            return res.status(400).json({ error: 'clienteId é obrigatório' });
+        }
         
         // Buscar tokens do cliente
         const pool = await sql.connect(dbConfig);
@@ -399,15 +487,15 @@ app.post('/api/send-notification-to-client', async (req, res) => {
         
         if (tokens.length === 0) {
             await pool.close();
-            return res.json({ success: false, message: 'Nenhum token encontrado' });
+            return res.json({ success: false, message: 'Nenhum token encontrado para o cliente' });
         }
         
-        const { messaging } = require('./firebase-config');
+        console.log(`📨 Enviando notificação para ${tokens.length} dispositivos`);
         
         const message = {
             data: {
-                titulo: titulo,
-                corpo: corpo,
+                titulo: titulo || "Red Iron",
+                corpo: corpo || "Nova notificação",
                 pedido_id: pedidoId ? pedidoId.toString() : ""
             },
             tokens: tokens
@@ -417,6 +505,8 @@ app.post('/api/send-notification-to-client', async (req, res) => {
         
         await pool.close();
         
+        console.log(`✅ Notificações enviadas: ${response.successCount} sucesso, ${response.failureCount} falhas`);
+        
         res.json({
             success: true,
             successCount: response.successCount,
@@ -424,10 +514,11 @@ app.post('/api/send-notification-to-client', async (req, res) => {
         });
         
     } catch (err) {
-        console.error('❌ Erro:', err.message);
+        console.error('❌ Erro ao enviar notificação:', err.message);
         res.status(500).json({ error: err.message });
     }
 });
+
 // Iniciar servidor
 app.listen(PORT, () => {
     console.log(`\n🚀 ======================================`);
@@ -436,5 +527,6 @@ app.listen(PORT, () => {
     console.log(`📍 Teste: http://localhost:${PORT}/api/health`);
     console.log(`📍 Teste BD: http://localhost:${PORT}/api/test-db`);
     console.log(`📍 Documentação: http://localhost:${PORT}/`);
+    console.log(`📍 Notificações: http://localhost:${PORT}/api/send-notification-to-client`);
     console.log(`🚀 ======================================`);
 });
